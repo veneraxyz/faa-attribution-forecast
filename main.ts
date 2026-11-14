@@ -27,6 +27,8 @@
 //     fewer than 20 past h-minute moves the outer quantile is pure Gaussian.
 //   - Every value is clamped to [0, 1], rounded to 6 decimals, and each row
 //     is forced non-decreasing after rounding.
+//   - A market with no prices at all is forecast flat at 0.5 rather than
+//     failing the case: an empty market must not invalidate its case-mates.
 //
 // Everything is deterministic: fixed iteration order, no randomness, no
 // clock, no network. Two runs on the same case write the same bytes.
@@ -115,7 +117,13 @@ function adaptiveSigma(prices: number[]): number {
  * quantiles of past h-minute moves from the recent window.
  */
 function forecast(m: CaseMarket, horizon: number): number[][] {
-  if (m.prices.length === 0) throw new Error(`market ${m.id} has no prices`);
+  // A market with no prices at all carries no information: forecast it flat
+  // at 0.5 (maximally uncertain) instead of failing the whole case. One
+  // empty market must not zero out the other markets' forecasts — a crash
+  // here would make the entire case invalid (scored as all-0.5).
+  if (m.prices.length === 0) {
+    return Array.from({ length: horizon }, () => [0.5, 0.5, 0.5, 0.5, 0.5]);
+  }
   const x = m.prices[m.prices.length - 1] as number;
   const sigma = adaptiveSigma(m.prices);
   const hist = m.prices.length > EMPIRICAL_WINDOW
