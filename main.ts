@@ -1,30 +1,45 @@
-// polymarket-faa-attribution-02 entry (Node 22, standard library only): an
-// adaptive-volatility forecaster. It beats the house persistence baseline
-// (fixed sigma 0.0025) by sizing each market's spread from its own recent
-// price history instead of one number for every market.
+// polymarket-faa-attribution-02 entry, v2 (Node 22, standard library only):
+// an adaptive-volatility forecaster with sibling-sum normalisation. It beats
+// the house persistence baseline (fixed sigma 0.0025, practice loss
+// 0.363589) and the v1 entry (0.286323) by sizing each market's spread from
+// its own recent price history AND by enforcing the one piece of structure
+// attribution markets share: the sibling outcomes sum to ~1.
 //
 // Design (validated on the practice cases with a local scorer that
 // reproduces the house baseline's stated practice loss of 0.363589 exactly;
-// this entry scores ~0.286 on the same cases):
+// this entry scores ~0.266 on the same cases, better than v1 on all 6):
 //
 //   - Median: persistence. The last price is the median at every horizon.
-//     Prediction-market prices are (near-)martingales, and mild drift terms
-//     (mean-reversion, momentum) tested worse on practice, so no drift.
+//     Prediction-market prices are (near-)martingales, and drift terms
+//     (mean-reversion toward the recent average, momentum) tested worse on
+//     practice, so no drift.
 //   - Spread: per-market robust sigma from recent 1-minute returns. Prices
 //     move in steps (87% of recent 1-minute returns in the practice data are
 //     exactly 0) with occasional jumps, so a plain standard deviation is
 //     dominated by one old jump and overstates the typical move. The IQR of
 //     recent returns measures the typical tick instead:
 //     sigma = max(IQR(last 60 min)/1.349, 0.7 * IQR(last 240 min)/1.349),
-//     floored at 0.0006 (jump insurance for markets that look quiet) and
-//     capped at 0.006. With fewer than 2 returns it falls back to 0.0025.
+//     floored at 0.0004 (jump insurance for markets that look quiet) and
+//     capped at 0.005. With fewer than 2 returns it falls back to 0.0025.
 //   - Inner quantiles (25%, 75%): Gaussian around the median with that sigma.
-//   - Outer quantiles (5%, 95%): a 50/50 blend of the Gaussian quantile and
-//     the empirical quantile of past h-minute moves from the last 720 minutes
-//     of prices. The empirical tails carry the jump risk the recent regime
+//   - Outer quantiles (5%, 95%): a 40/60 blend of the empirical quantile of
+//     past h-minute moves from the last 720 minutes and the Gaussian
+//     quantile. The empirical tails carry the jump risk the recent regime
 //     actually showed (asymmetric when recent moves were one-sided); the
-//     Gaussian half keeps them sane when the recent window was quiet. With
-//     fewer than 20 past h-minute moves the outer quantile is pure Gaussian.
+//     Gaussian majority keeps them sane when the recent window was quiet.
+//     With fewer than 20 past h-minute moves the outer quantile is pure
+//     Gaussian.
+//   - Sibling-sum normalisation: after forecasting every market, each
+//     horizon row's medians are scaled toward summing to 1 (all five
+//     quantiles of a market scale by the same factor, so spreads scale with
+//     the median). The correction is ASYMMETRIC and grows with horizon:
+//     when the median sum is above 1 it is corrected at full strength (a
+//     sum above 1 cannot come from missing outcomes, only mispricing), when
+//     below 1 only at quarter strength (a low sum may mean the case lists
+//     only some outcomes). Strength grows as 1 - exp(-h/45): the sum's
+//     deviation is already mispricing at the checkpoint, but it takes about
+//     an hour to fully correct. Markets with no prices are excluded from
+//     the sum and left untouched.
 //   - Every value is clamped to [0, 1], rounded to 6 decimals, and each row
 //     is forced non-decreasing after rounding.
 //   - A market with no prices at all is forecast flat at 0.5 rather than
@@ -51,14 +66,26 @@ const QUANTILES = [0.05, 0.25, 0.5, 0.75, 0.95];
 const Z = [-1.644854, -0.67449, 0, 0.67449, 1.644854];
 
 /** Floor/cap on the per-market robust sigma (price units per sqrt-minute). */
-const SIGMA_FLOOR = 0.0006;
-const SIGMA_CAP = 0.006;
+const SIGMA_FLOOR = 0.0004;
+const SIGMA_CAP = 0.005;
 /** Fallback sigma when a market has too little history to estimate one. */
 const SIGMA_FALLBACK = 0.0025;
 /** Minutes of recent prices the empirical tails are cut from. */
 const EMPIRICAL_WINDOW = 720;
 /** Minimum past h-minute moves for the empirical tail to be used. */
 const EMPIRICAL_MIN_MOVES = 20;
+/** Weight of the Gaussian quantile in the outer-quantile blend (the rest is
+ *  the empirical quantile of past h-minute moves). */
+const GAUSSIAN_OUTER_WEIGHT = 0.6;
+/** Sibling-sum normalisation: the correction's time constant in minutes —
+ *  strength at horizon h is (1 - exp(-h / NORM_TAU)). */
+const NORM_TAU = 45;
+/** Normalisation strength when the median sum is BELOW 1 (a low sum may
+ *  mean the case lists only some outcomes, so correct gently). */
+const NORM_UP = 0.25;
+/** Normalisation strength when the median sum is ABOVE 1 (a sum above 1
+ *  cannot come from missing outcomes, only mispricing, so correct fully). */
+const NORM_DOWN = 1.0;
 
 interface CaseMarket {
   id: string;
@@ -144,8 +171,8 @@ function forecast(m: CaseMarket, horizon: number): number[][] {
         moves[i] = (hist[i + h] as number) - (hist[i] as number);
       }
       moves.sort((a, b) => a - b);
-      lo = 0.5 * quantile(moves, 0.05) + 0.5 * (g[0] as number);
-      hi = 0.5 * quantile(moves, 0.95) + 0.5 * (g[4] as number);
+      lo = (1 - GAUSSIAN_OUTER_WEIGHT) * quantile(moves, 0.05) + GAUSSIAN_OUTER_WEIGHT * (g[0] as number);
+      hi = (1 - GAUSSIAN_OUTER_WEIGHT) * quantile(moves, 0.95) + GAUSSIAN_OUTER_WEIGHT * (g[4] as number);
     }
     const row = [
       price6(x + lo),
@@ -163,6 +190,43 @@ function forecast(m: CaseMarket, horizon: number): number[][] {
   return rows;
 }
 
+/**
+ * Sibling-sum normalisation for one case, applied in place. Attribution
+ * markets in a case sum to ~1, so at each horizon the medians should too.
+ * Every market's whole row is scaled by one factor (spreads scale with the
+ * median), the factor being 1 + s * (1 - exp(-h/45)) * (1/S - 1) where S is
+ * the row's median sum and s is NORM_UP (S < 1) or NORM_DOWN (S > 1). The
+ * asymmetry is deliberate: a sum above 1 is mispricing and corrects fully,
+ * a sum below 1 may mean the case lists only some outcomes and is corrected
+ * gently. Markets with no prices are excluded from the sum and left flat
+ * at 0.5. A case with fewer than two priced markets is left alone (a lone
+ * market has no siblings to sum against).
+ */
+function normaliseForecasts(rows: number[][][], empty: boolean[]): void {
+  const idx: number[] = [];
+  for (let i = 0; i < rows.length; i++) {
+    if (!empty[i]) idx.push(i);
+  }
+  if (idx.length < 2) return;
+  const horizon = (rows[0] as number[][]).length;
+  for (let h = 0; h < horizon; h++) {
+    let sum = 0;
+    for (const i of idx) sum += (rows[i] as number[][])[h][2] as number;
+    if (sum <= 0) continue;
+    const growth = 1 - Math.exp(-(h + 1) / NORM_TAU);
+    const strength = sum < 1 ? NORM_UP : NORM_DOWN;
+    const f = 1 + strength * growth * (1 / sum - 1);
+    if (f === 1) continue;
+    for (const i of idx) {
+      const row = (rows[i] as number[][])[h] as number[];
+      for (let j = 0; j < 5; j++) row[j] = price6((row[j] as number) * f);
+      for (let j = 1; j < 5; j++) {
+        if ((row[j] as number) < (row[j - 1] as number)) row[j] = row[j - 1] as number;
+      }
+    }
+  }
+}
+
 mkdirSync(OUTPUT_DIR, { recursive: true });
 // Every case file, in name order, so two runs write the same bytes.
 const inputs = readdirSync(INPUT_DIR).filter((f) => f.endsWith('.in')).sort();
@@ -170,6 +234,8 @@ for (const file of inputs) {
   const id = file.slice(0, -'.in'.length);
   const c = JSON.parse(readFileSync(join(INPUT_DIR, file), 'utf8')) as Case;
   if (c.quantiles.length !== QUANTILES.length || c.quantiles.some((t, j) => t !== QUANTILES[j])) throw new Error(`${file} asks for quantiles ${JSON.stringify(c.quantiles)}, not ${JSON.stringify(QUANTILES)}`);
-  const forecasts = c.markets.map((m) => ({ id: m.id, q: forecast(m, c.horizon_minutes) }));
+  const rows = c.markets.map((m) => forecast(m, c.horizon_minutes));
+  normaliseForecasts(rows, c.markets.map((m) => m.prices.length === 0));
+  const forecasts = c.markets.map((m, i) => ({ id: m.id, q: rows[i] }));
   writeFileSync(join(OUTPUT_DIR, `${id}.out`), `${JSON.stringify({ forecasts })}\n`);
 }
